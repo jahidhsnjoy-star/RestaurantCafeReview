@@ -1,0 +1,17 @@
+**/.env
+**/.env.*
+!**/.env.example
+**/node_modules/
+.dist/
+**/build/
+**/.gradle/
+**/coverage/
+*.log
+.DS_Store
+**/*.keystore
+**/*.jks
+**/.bundle/config
+**/*.keystore
+**/*.jks
+
+/server/.env.example
