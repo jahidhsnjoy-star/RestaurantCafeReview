@@ -1,0 +1,55 @@
+name: Backend CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: restaurant_review_test
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      DB_HOST: 127.0.0.1
+      DB_USER: root
+      DB_PASSWORD: ""
+      DB_NAME: restaurant_review_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Prepare disposable MySQL test schema
+        working-directory: server
+        run: |
+          mysql --host=127.0.0.1 --user=root restaurant_review_test < tests/fixtures/ci-base-schema.sql
+          mysql --host=127.0.0.1 --user=root restaurant_review_test < migrations/003_add_usernames.sql
+          mysql --host=127.0.0.1 --user=root restaurant_review_test < migrations/004_add_email_verification.sql
+
+      - name: Run backend tests
+        working-directory: server
+        run: npm test
