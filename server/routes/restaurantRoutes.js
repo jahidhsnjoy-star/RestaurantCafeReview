@@ -2,20 +2,93 @@ const express = require('express');
 const router = express.Router();
 
 const db = require('../config/db');
+const authenticateToken = require('../middleware/authMiddleware');
+const optionalAuthenticateToken = authenticateToken.optional;
+const {reviewImageUpload} = require('../middleware/reviewImageUpload');
+const reviewImageStorage = require('../config/cloudinary');
+
+const query = (sql, values) => new Promise((resolve, reject) => {
+  db.query(sql, values, (error, results) => {
+    if (error) {
+      reject(error);
+      return;
+    }
+
+    resolve(results);
+  });
+});
+
+const parseRating = value => {
+  const rating = Number(value);
+  return Number.isInteger(rating) && rating >= 1 && rating <= 5
+    ? rating
+    : null;
+};
+
+const getReviewText = value => {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
+  return typeof value === 'string' ? value : undefined;
+};
+
+const cleanupReviewImage = async publicId => {
+  if (!publicId) {
+    return true;
+  }
+
+  try {
+    const removed = await reviewImageStorage.deleteReviewImage(publicId);
+    if (!removed) {
+      console.error('Cloudinary review image cleanup failed');
+    }
+    return removed;
+  } catch {
+    console.error('Cloudinary review image cleanup failed');
+    return false;
+  }
+};
+
+const parseRestaurantId = value =>
+  /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) > 0
+    ? Number(value)
+    : null;
+
+const getReactionSummary = async (restaurantId, userId) => {
+  const results = await query(
+    `SELECT
+       COUNT(CASE WHEN reaction_type = 'like' THEN 1 END) AS like_count,
+       COUNT(CASE WHEN reaction_type = 'dislike' THEN 1 END) AS dislike_count,
+       MAX(CASE WHEN user_id = ? THEN reaction_type END) AS user_reaction
+     FROM restaurant_reactions
+     WHERE restaurant_id = ?`,
+    [userId, restaurantId],
+  );
+  const summary = results[0];
+  return {
+    like_count: Number(summary.like_count),
+    dislike_count: Number(summary.dislike_count),
+    user_reaction: summary.user_reaction,
+  };
+};
+
+const sendReactionSummary = async (res, restaurantId, userId) => {
+  try {
+    return res.json(await getReactionSummary(restaurantId, userId));
+  } catch (error) {
+    console.error('Error fetching restaurant reactions:', error?.code || 'database error');
+    return res.status(500).json({message: 'Failed to fetch restaurant reactions'});
+  }
+};
 
 
 // ===============================
 // Favorite Restaurant
 // ===============================
-router.post('/:id/favorite', (req, res) => {
+router.post('/:id/favorite', authenticateToken, (req, res) => {
   const restaurantId = req.params.id;
-  const userId = Number(req.body.user_id);
-
-  if (!Number.isInteger(userId) || userId < 1) {
-    return res.status(400).json({
-      message: 'A valid user_id is required',
-    });
-  }
+  const userId = req.user.user_id;
 
   const sql = `
     INSERT IGNORE INTO favorites (user_id, restaurant_id)
@@ -44,15 +117,9 @@ router.post('/:id/favorite', (req, res) => {
 // ===============================
 // Remove Favorite Restaurant
 // ===============================
-router.delete('/:id/favorite', (req, res) => {
+router.delete('/:id/favorite', authenticateToken, (req, res) => {
   const restaurantId = req.params.id;
-  const userId = Number(req.query.user_id || req.body.user_id);
-
-  if (!Number.isInteger(userId) || userId < 1) {
-    return res.status(400).json({
-      message: 'A valid user_id is required',
-    });
-  }
+  const userId = req.user.user_id;
 
   const sql = `
     DELETE FROM favorites
@@ -80,15 +147,9 @@ router.delete('/:id/favorite', (req, res) => {
 // ===============================
 // Check Favorite Status
 // ===============================
-router.get('/:id/favorite', (req, res) => {
+router.get('/:id/favorite', authenticateToken, (req, res) => {
   const restaurantId = req.params.id;
-  const userId = Number(req.query.user_id);
-
-  if (!Number.isInteger(userId) || userId < 1) {
-    return res.status(400).json({
-      message: 'A valid user_id is required',
-    });
-  }
+  const userId = req.user.user_id;
 
   const sql = `
     SELECT favorite_id
@@ -112,9 +173,80 @@ router.get('/:id/favorite', (req, res) => {
 
 
 // ===============================
+// Add or change a restaurant reaction
+// ===============================
+router.put('/:id/reaction', authenticateToken, async (req, res) => {
+  const restaurantId = parseRestaurantId(req.params.id);
+  const reaction = req.body?.reaction;
+
+  if (restaurantId === null) {
+    return res.status(400).json({message: 'Invalid restaurant ID'});
+  }
+
+  if (reaction !== 'like' && reaction !== 'dislike') {
+    return res.status(400).json({message: 'Reaction must be like or dislike'});
+  }
+
+  try {
+    const restaurants = await query(
+      'SELECT restaurant_id FROM restaurants WHERE restaurant_id = ? LIMIT 1',
+      [restaurantId],
+    );
+    if (restaurants.length === 0) {
+      return res.status(404).json({message: 'Restaurant not found'});
+    }
+
+    await query(
+      `INSERT INTO restaurant_reactions (user_id, restaurant_id, reaction_type)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE reaction_type = VALUES(reaction_type)`,
+      [req.user.user_id, restaurantId, reaction],
+    );
+  } catch (error) {
+    console.error('Error updating restaurant reaction:', error?.code || 'database error');
+    return res.status(500).json({message: 'Failed to update restaurant reaction'});
+  }
+
+  return sendReactionSummary(res, restaurantId, req.user.user_id);
+});
+
+// ===============================
+// Remove a restaurant reaction
+// ===============================
+router.delete('/:id/reaction', authenticateToken, async (req, res) => {
+  const restaurantId = parseRestaurantId(req.params.id);
+
+  if (restaurantId === null) {
+    return res.status(400).json({message: 'Invalid restaurant ID'});
+  }
+
+  try {
+    const restaurants = await query(
+      'SELECT restaurant_id FROM restaurants WHERE restaurant_id = ? LIMIT 1',
+      [restaurantId],
+    );
+    if (restaurants.length === 0) {
+      return res.status(404).json({message: 'Restaurant not found'});
+    }
+
+    await query(
+      `DELETE FROM restaurant_reactions
+       WHERE user_id = ? AND restaurant_id = ?`,
+      [req.user.user_id, restaurantId],
+    );
+  } catch (error) {
+    console.error('Error removing restaurant reaction:', error?.code || 'database error');
+    return res.status(500).json({message: 'Failed to remove restaurant reaction'});
+  }
+
+  return sendReactionSummary(res, restaurantId, req.user.user_id);
+});
+
+
+// ===============================
 // Get All Restaurants
 // ===============================
-router.get('/', (req, res) => {
+router.get('/', optionalAuthenticateToken, (req, res) => {
   const hasListOptions =
     req.query.page !== undefined ||
     req.query.limit !== undefined ||
@@ -132,14 +264,30 @@ router.get('/', (req, res) => {
       r.opening_time,
       r.closing_time,
       r.price_range,
-      r.image
+      r.image,
+      r.video_url,
+      COALESCE(reaction_counts.like_count, 0) AS like_count,
+      COALESCE(reaction_counts.dislike_count, 0) AS dislike_count,
+      current_reaction.reaction_type AS user_reaction
     FROM restaurants r
     JOIN categories c
       ON r.category_id = c.category_id
+    LEFT JOIN (
+      SELECT
+        restaurant_id,
+        COUNT(CASE WHEN reaction_type = 'like' THEN 1 END) AS like_count,
+        COUNT(CASE WHEN reaction_type = 'dislike' THEN 1 END) AS dislike_count
+      FROM restaurant_reactions
+      GROUP BY restaurant_id
+    ) reaction_counts
+      ON reaction_counts.restaurant_id = r.restaurant_id
+    LEFT JOIN restaurant_reactions current_reaction
+      ON current_reaction.restaurant_id = r.restaurant_id
+      AND current_reaction.user_id = ?
   `;
 
   if (!hasListOptions) {
-    db.query(`${selectSql} ORDER BY r.restaurant_id`, (err, results) => {
+    db.query(`${selectSql} ORDER BY r.restaurant_id`, [req.user?.user_id ?? null], (err, results) => {
       if (err) {
         console.error('Error fetching restaurants:', err);
 
@@ -251,7 +399,7 @@ router.get('/', (req, res) => {
 
         db.query(
           `${selectSql} ${whereSql} ORDER BY r.restaurant_id LIMIT ? OFFSET ?`,
-          [...filterValues, limit, offset],
+          [req.user?.user_id ?? null, ...filterValues, limit, offset],
           (err, results) => {
             if (err) {
               console.error('Error fetching restaurants:', err);
@@ -288,6 +436,7 @@ router.get('/:id/reviews', (req, res) => {
       rv.user_id,
       rv.rating,
       rv.review_text,
+      rv.image_url,
       rv.created_at,
       u.name AS user_name
     FROM reviews rv
@@ -361,146 +510,223 @@ router.get('/:id', (req, res) => {
 // ===============================
 // Add Review
 // ===============================
-router.post('/:id/reviews', (req, res) => {
+router.post('/:id/reviews', authenticateToken, reviewImageUpload, async (req, res) => {
   const restaurantId = req.params.id;
+  const rating = parseRating(req.body.rating);
+  const reviewText = getReviewText(req.body.review_text);
 
-  const {
-    user_id,
-    rating,
-    review_text,
-  } = req.body;
-
-  if (!user_id || !rating) {
+  if (rating === null) {
     return res.status(400).json({
-      message: 'User ID and rating are required',
+      message: 'Rating must be an integer between 1 and 5',
     });
   }
 
-  const sql = `
-    INSERT INTO reviews
-    (user_id, restaurant_id, rating, review_text)
-    VALUES (?, ?, ?, ?)
-  `;
+  if (reviewText === undefined) {
+    return res.status(400).json({message: 'Review text must be a string'});
+  }
 
-  db.query(
-    sql,
-    [
-      user_id,
-      restaurantId,
-      rating,
-      review_text || null,
-    ],
-    (err, result) => {
-      if (err) {
-        console.error('Error adding review:', err);
+  let uploadedImage = null;
+  if (req.file) {
+    try {
+      uploadedImage = await reviewImageStorage.uploadReviewImage(req.file.buffer);
+    } catch {
+      console.error('Cloudinary review image upload failed');
+      return res.status(502).json({message: 'Unable to upload review image'});
+    }
+  }
 
-        return res.status(500).json({
-          message: 'Failed to add review',
-        });
-      }
+  try {
+    const result = await query(
+      `INSERT INTO reviews
+       (user_id, restaurant_id, rating, review_text, image_url, cloudinary_public_id)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        req.user.user_id,
+        restaurantId,
+        rating,
+        reviewText,
+        uploadedImage?.imageUrl ?? null,
+        uploadedImage?.publicId ?? null,
+      ],
+    );
 
-      res.status(201).json({
-        message: 'Review added successfully',
-        review_id: result.insertId,
-      });
-    },
-  );
+    return res.status(201).json({
+      message: 'Review added successfully',
+      review_id: result.insertId,
+      image_url: uploadedImage?.imageUrl ?? null,
+      cloudinary_public_id: uploadedImage?.publicId ?? null,
+    });
+  } catch (error) {
+    if (uploadedImage) {
+      await cleanupReviewImage(uploadedImage.publicId);
+    }
+    console.error('Error adding review:', error?.code || 'database error');
+    return res.status(500).json({message: 'Failed to add review'});
+  }
 });
 
 
 // ===============================
 // Update Review
 // ===============================
-router.put('/:id/reviews/:reviewId', (req, res) => {
-  const restaurantId = req.params.id;
-  const reviewId = req.params.reviewId;
+router.put(
+  '/:id/reviews/:reviewId',
+  authenticateToken,
+  reviewImageUpload,
+  async (req, res) => {
+    const restaurantId = req.params.id;
+    const reviewId = req.params.reviewId;
+    const rating = parseRating(req.body.rating);
+    const reviewText = getReviewText(req.body.review_text);
+    const removeImageValue = req.body.remove_image;
+    const shouldRemoveImage =
+      removeImageValue === true || removeImageValue === 'true';
 
-  const {
-    rating,
-    review_text,
-  } = req.body;
-
-  if (!rating) {
-    return res.status(400).json({
-      message: 'Rating is required',
-    });
-  }
-
-  const sql = `
-    UPDATE reviews
-    SET
-      rating = ?,
-      review_text = ?
-    WHERE review_id = ?
-    AND restaurant_id = ?
-  `;
-
-  db.query(
-    sql,
-    [
-      rating,
-      review_text || null,
-      reviewId,
-      restaurantId,
-    ],
-    (err, result) => {
-      if (err) {
-        console.error('Error updating review:', err);
-
-        return res.status(500).json({
-          message: 'Failed to update review',
-        });
-      }
-
-      if (result.affectedRows === 0) {
-        return res.status(404).json({
-          message: 'Review not found',
-        });
-      }
-
-      res.json({
-        message: 'Review updated successfully',
+    if (rating === null) {
+      return res.status(400).json({
+        message: 'Rating must be an integer between 1 and 5',
       });
-    },
-  );
-});
+    }
+
+    if (reviewText === undefined) {
+      return res.status(400).json({message: 'Review text must be a string'});
+    }
+
+    if (
+      removeImageValue !== undefined &&
+      removeImageValue !== true &&
+      removeImageValue !== false &&
+      removeImageValue !== 'true' &&
+      removeImageValue !== 'false'
+    ) {
+      return res.status(400).json({message: 'remove_image must be a boolean'});
+    }
+
+    if (req.file && shouldRemoveImage) {
+      return res.status(400).json({
+        message: 'Choose an image to replace the current image or remove it, not both',
+      });
+    }
+
+    let existingReview;
+    try {
+      const results = await query(
+        `SELECT review_id, image_url, cloudinary_public_id
+         FROM reviews
+         WHERE review_id = ? AND restaurant_id = ? AND user_id = ?
+         LIMIT 1`,
+        [reviewId, restaurantId, req.user.user_id],
+      );
+      existingReview = results[0];
+    } catch (error) {
+      console.error('Error checking review ownership:', error?.code || 'database error');
+      return res.status(500).json({message: 'Failed to update review'});
+    }
+
+    if (!existingReview) {
+      return res.status(404).json({message: 'Review not found'});
+    }
+
+    let uploadedImage = null;
+    if (req.file) {
+      try {
+        uploadedImage = await reviewImageStorage.uploadReviewImage(req.file.buffer);
+      } catch {
+        console.error('Cloudinary review image upload failed');
+        return res.status(502).json({message: 'Unable to upload review image'});
+      }
+    }
+
+    const imageUrl = uploadedImage
+      ? uploadedImage.imageUrl
+      : shouldRemoveImage
+        ? null
+        : existingReview.image_url;
+    const publicId = uploadedImage
+      ? uploadedImage.publicId
+      : shouldRemoveImage
+        ? null
+        : existingReview.cloudinary_public_id;
+
+    try {
+      await query(
+        `UPDATE reviews
+         SET rating = ?, review_text = ?, image_url = ?, cloudinary_public_id = ?
+         WHERE review_id = ? AND restaurant_id = ? AND user_id = ?`,
+        [
+          rating,
+          reviewText,
+          imageUrl,
+          publicId,
+          reviewId,
+          restaurantId,
+          req.user.user_id,
+        ],
+      );
+    } catch (error) {
+      if (uploadedImage) {
+        await cleanupReviewImage(uploadedImage.publicId);
+      }
+      console.error('Error updating review:', error?.code || 'database error');
+      return res.status(500).json({message: 'Failed to update review'});
+    }
+
+    const imageChanged = Boolean(uploadedImage || shouldRemoveImage);
+    const cleanupPending =
+      imageChanged && existingReview.cloudinary_public_id
+        ? !(await cleanupReviewImage(existingReview.cloudinary_public_id))
+        : false;
+
+    return res.json({
+      message: 'Review updated successfully',
+      image_url: imageUrl,
+      cleanup_pending: cleanupPending,
+    });
+  },
+);
 
 // ===============================
 // Delete Review
 // ===============================
-router.delete('/:id/reviews/:reviewId', (req, res) => {
+router.delete('/:id/reviews/:reviewId', authenticateToken, async (req, res) => {
   const restaurantId = req.params.id;
   const reviewId = req.params.reviewId;
 
-  const sql = `
-    DELETE FROM reviews
-    WHERE review_id = ?
-    AND restaurant_id = ?
-  `;
+  try {
+    const results = await query(
+      `SELECT review_id, cloudinary_public_id
+       FROM reviews
+       WHERE review_id = ? AND restaurant_id = ? AND user_id = ?
+       LIMIT 1`,
+      [reviewId, restaurantId, req.user.user_id],
+    );
 
-  db.query(
-    sql,
-    [reviewId, restaurantId],
-    (err, result) => {
-      if (err) {
-        console.error('Error deleting review:', err);
+    if (!results[0]) {
+      return res.status(404).json({message: 'Review not found'});
+    }
 
-        return res.status(500).json({
-          message: 'Failed to delete review',
-        });
-      }
+    const result = await query(
+      `DELETE FROM reviews
+       WHERE review_id = ? AND restaurant_id = ? AND user_id = ?`,
+      [reviewId, restaurantId, req.user.user_id],
+    );
 
-      if (result.affectedRows === 0) {
-        return res.status(404).json({
-          message: 'Review not found',
-        });
-      }
+    if (result.affectedRows === 0) {
+      return res.status(404).json({message: 'Review not found'});
+    }
 
-      res.json({
-        message: 'Review deleted successfully',
-      });
-    },
-  );
+    const cleanupPending = results[0].cloudinary_public_id
+      ? !(await cleanupReviewImage(results[0].cloudinary_public_id))
+      : false;
+
+    return res.json({
+      message: 'Review deleted successfully',
+      cleanup_pending: cleanupPending,
+    });
+  } catch (error) {
+    console.error('Error deleting review:', error?.code || 'database error');
+    return res.status(500).json({message: 'Failed to delete review'});
+  }
 });
 
 module.exports = router;

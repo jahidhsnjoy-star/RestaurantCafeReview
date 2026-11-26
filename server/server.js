@@ -5,6 +5,9 @@ const db = require('./config/db');
 const restaurantRoutes = require('./routes/restaurantRoutes');
 const userRoutes = require('./routes/userRoutes');
 const assistantRoutes = require('./routes/assistantRoutes');
+const reservationRoutes = require('./routes/reservationRoutes');
+const graphqlRoutes = require('./routes/graphqlRoutes');
+const authenticateToken = require('./middleware/authMiddleware');
 
 const app = express();
 
@@ -19,15 +22,8 @@ app.get('/', (req, res) => {
 });
 
 // Favorite restaurants for a user
-app.get('/api/favorites', (req, res) => {
-  const userId = Number(req.query.user_id);
-
-  if (!Number.isInteger(userId) || userId < 1) {
-    return res.status(400).json({
-      message: 'A valid user_id is required',
-    });
-  }
-
+app.get('/api/favorites', authenticateToken, (req, res) => {
+  const userId = req.user.user_id;
   const sql = `
     SELECT
       r.restaurant_id,
@@ -66,6 +62,8 @@ app.get('/api/favorites', (req, res) => {
 app.use('/api/restaurants', restaurantRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/assistant', assistantRoutes);
+app.use('/api/reservations', reservationRoutes);
+app.use('/graphql', graphqlRoutes);
 
 const PORT = 5000;
 

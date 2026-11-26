@@ -31,4 +31,34 @@ const authenticateToken = (req, res, next) => {
   }
 };
 
+authenticateToken.optional = (req, res, next) => {
+  const authorization = req.get('authorization');
+  if (!authorization) {
+    return next();
+  }
+
+  if (!authorization.startsWith('Bearer ')) {
+    return res.status(401).json({message: 'Invalid authentication token'});
+  }
+
+  if (!process.env.JWT_SECRET) {
+    return res.status(500).json({message: 'Authentication is not configured on the server'});
+  }
+
+  try {
+    const payload = jwt.verify(authorization.slice(7), process.env.JWT_SECRET);
+    if (!payload || typeof payload !== 'object' || !Number.isInteger(payload.user_id)) {
+      return res.status(401).json({message: 'Invalid authentication token'});
+    }
+
+    req.user = {
+      user_id: payload.user_id,
+      role: payload.role,
+    };
+    return next();
+  } catch (error) {
+    return res.status(401).json({message: 'Invalid or expired authentication token'});
+  }
+};
+
 module.exports = authenticateToken;
