@@ -1,9 +1,10 @@
 const assert = require('node:assert/strict');
 const http = require('node:http');
-const {after, before, test} = require('node:test');
+const {after, before, mock, test} = require('node:test');
 const express = require('express');
 
 const db = require('../config/db');
+const emailService = require('../services/emailService');
 
 const nativeFetch = global.fetch;
 const sentCodes = new Map();
@@ -11,6 +12,8 @@ let providerRejectRecipient = false;
 let server;
 let apiBaseUrl;
 const testEmails = [];
+
+process.env.JWT_SECRET = 'email-verification-test-secret';
 
 const request = async (path, body, {method = 'POST', token} = {}) => {
   const response = await nativeFetch(`${apiBaseUrl}${path}`, {
@@ -27,20 +30,15 @@ const request = async (path, body, {method = 'POST', token} = {}) => {
 before(async () => {
   process.env.RESEND_API_KEY = 'test-key-not-used-for-network';
   process.env.EMAIL_FROM = 'test@example.test';
-  process.env.EMAIL_FROM = 'test@example.test';
-  global.fetch = async (url, options) => {
-    assert.equal(url, 'https://api.resend.com/emails');
-    const message = JSON.parse(options.body);
+  mock.method(emailService, 'sendVerificationEmail', async (email, otp) => {
     if (providerRejectRecipient) {
-      return new Response(JSON.stringify({
-        message: 'You can only send testing emails to your own email address',
-      }), {status: 403});
+      const error = new Error('RESEND_TEST_RECIPIENT_REJECTED');
+      error.code = 'RESEND_TEST_RECIPIENT_REJECTED';
+      throw error;
     }
-    const code = message.text.match(/\b\d{6}\b/)?.[0];
-    assert.ok(code);
-    sentCodes.set(message.to[0], code);
-    return new Response(JSON.stringify({id: 'test-email-id'}), {status: 200});
-  };
+    assert.match(otp, /^\d{6}$/);
+    sentCodes.set(email, otp);
+  });
 
   const app = express();
   app.use(express.json());
@@ -51,7 +49,7 @@ before(async () => {
 });
 
 after(async () => {
-  global.fetch = nativeFetch;
+  mock.restoreAll();
   if (server) {
     await new Promise(resolve => server.close(resolve));
   }
